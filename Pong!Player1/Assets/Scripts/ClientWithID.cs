@@ -1,102 +1,169 @@
-using System;
-using System.Net;
+using UnityEngine;
+using UnityEngine.UI;
 using System.Net.Sockets;
+using System.Net;
 using System.Text;
 using System.Threading;
-using System.Collections.Concurrent;
-using UnityEngine;
+using System.Globalization;
+using System.Collections.Generic;
 
 public class ClientRemote : MonoBehaviour
 {
-    public Rigidbody2D localCube;
-    public Rigidbody2D remoteCube;
-    public Rigidbody2D ball;
-    public string serverIP = "127.0.0.1";
-    public int serverPort = 7777;
-    public int id = 2;
+    UdpClient client;
+    Thread receiveThread;
+    IPEndPoint serverEP;
+    int myId = -1;
 
-    private UdpClient udpClient;
-    private Thread receiveThread;
-    private IPEndPoint remoteEndPoint;
-    private ConcurrentQueue<Action> mainThreadActions = new ConcurrentQueue<Action>();
+    public GameObject localCube;   // Será controlado pelo outro jogador
+    public GameObject remoteCube;  // Será controlado pelo jogador remoto
+    public float moveSpeed = 5f;
+
+    // Bola
+    public GameObject ballPrefab;
+    GameObject ballObject;
+    Vector2 ballPos = Vector2.zero;
+
+    Vector2 localPos = Vector2.zero;
+
+    // Placar
+    Text scoreText;
+
+    // Ações a executar na thread principal
+    Queue<System.Action> mainThreadActions = new Queue<System.Action>();
 
     void Start()
     {
-        udpClient = new UdpClient();
-        remoteEndPoint = new IPEndPoint(IPAddress.Parse(serverIP), serverPort);
-        receiveThread = new Thread(new ThreadStart(ReceiveData));
+        client = new UdpClient();
+        serverEP = new IPEndPoint(IPAddress.Parse("10.57.1.137"), 5001);
+        client.Connect(serverEP);
+
+        receiveThread = new Thread(ReceiveData);
         receiveThread.IsBackground = true;
         receiveThread.Start();
 
-        SendMessageToServer("ID:" + id);
+        byte[] hello = Encoding.UTF8.GetBytes("HELLO");
+        client.Send(hello, hello.Length);
+
+        if (ballPrefab != null)
+            ballObject = Instantiate(ballPrefab, Vector3.zero, Quaternion.identity);
+        else
+        {
+            ballObject = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            ballObject.transform.localScale = new Vector3(0.5f, 0.5f, 0.5f);
+            ballObject.transform.position = Vector3.zero;
+            ballObject.name = "Bola";
+        }
+
+        // Cria placar automaticamente
+        Canvas canvas = new GameObject("Canvas").AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+        CanvasScaler scaler = canvas.gameObject.AddComponent<CanvasScaler>();
+        scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+        canvas.gameObject.AddComponent<GraphicRaycaster>();
+
+        GameObject textGO = new GameObject("ScoreText");
+        textGO.transform.SetParent(canvas.transform);
+        scoreText = textGO.AddComponent<Text>();
+        scoreText.font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
+        scoreText.fontSize = 48;
+        scoreText.alignment = TextAnchor.UpperCenter;
+        scoreText.color = Color.white;
+        RectTransform rt = scoreText.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.5f, 1f);
+        rt.anchorMax = new Vector2(0.5f, 1f);
+        rt.anchoredPosition = new Vector2(0f, -20f);
+        rt.sizeDelta = new Vector2(400f, 100f);
+        scoreText.text = "0  -  0";
     }
 
     void Update()
     {
-        float moveY = Input.GetAxisRaw("Vertical");
-        Vector2 newPos = localCube.position + new Vector2(0, moveY) * 8f * Time.deltaTime;
-        localCube.MovePosition(newPos);
+        while (mainThreadActions.Count > 0)
+            mainThreadActions.Dequeue().Invoke();
 
-        string message = $"POS:{id}:{localCube.position.x}:{localCube.position.y}";
-        SendMessageToServer(message);
+        // Movimento jogador remoto (teclado controla remoteCube)
+        if (Input.GetKey(KeyCode.W))
+            remoteCube.transform.Translate(Vector2.up * Time.deltaTime * moveSpeed);
+        if (Input.GetKey(KeyCode.S))
+            remoteCube.transform.Translate(Vector2.down * Time.deltaTime * moveSpeed);
 
-        while (mainThreadActions.TryDequeue(out var action))
-            action.Invoke();
+        string msg = "POS:" +
+                     remoteCube.transform.position.x.ToString("F2", CultureInfo.InvariantCulture) + ";" +
+                     remoteCube.transform.position.y.ToString("F2", CultureInfo.InvariantCulture);
+        byte[] data = Encoding.UTF8.GetBytes(msg);
+        client.Send(data, data.Length);
+
+        // Atualiza posição do outro jogador
+        localCube.transform.position = Vector3.Lerp(localCube.transform.position, localPos, Time.deltaTime * 10f);
+
+        if (ballObject != null)
+            ballObject.transform.position = Vector3.Lerp(ballObject.transform.position, ballPos, Time.deltaTime * 10f);
     }
 
     void ReceiveData()
     {
-        IPEndPoint anyIP = new IPEndPoint(IPAddress.Any, 0);
+        IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+
         while (true)
         {
             try
             {
-                byte[] data = udpClient.Receive(ref anyIP);
-                string text = Encoding.UTF8.GetString(data);
-                HandleServerMessage(text);
+                byte[] data = client.Receive(ref remoteEP);
+                string msg = Encoding.UTF8.GetString(data);
+
+                if (msg.StartsWith("ASSIGN:"))
+                {
+                    myId = int.Parse(msg.Substring(7));
+                    Debug.Log("[Cliente] Recebi ID = " + myId);
+                }
+                else if (msg.StartsWith("POS:"))
+                {
+                    string[] parts = msg.Substring(4).Split(';');
+                    if (parts.Length == 3)
+                    {
+                        int id = int.Parse(parts[0]);
+                        if (id != myId)
+                        {
+                            float x = float.Parse(parts[1], CultureInfo.InvariantCulture);
+                            float y = float.Parse(parts[2], CultureInfo.InvariantCulture);
+                            localPos = new Vector2(x, y);
+                        }
+                    }
+                }
+                else if (msg.StartsWith("BALL:"))
+                {
+                    string[] parts = msg.Substring(5).Split(';');
+                    if (parts.Length == 2)
+                    {
+                        float x = float.Parse(parts[0], CultureInfo.InvariantCulture);
+                        float y = float.Parse(parts[1], CultureInfo.InvariantCulture);
+                        mainThreadActions.Enqueue(() => ballPos = new Vector2(x, y));
+                    }
+                }
+                else if (msg.StartsWith("SCORE:"))
+                {
+                    string[] parts = msg.Substring(6).Split(';');
+                    if (parts.Length == 2)
+                    {
+                        int s1 = int.Parse(parts[0]);
+                        int s2 = int.Parse(parts[1]);
+                        mainThreadActions.Enqueue(() =>
+                        {
+                            scoreText.text = $"{s1}  -  {s2}";
+                        });
+                    }
+                }
             }
-            catch (Exception e)
+            catch (SocketException ex)
             {
-                Debug.LogError(e.Message);
+                Debug.LogError("SocketException: " + ex.Message);
             }
         }
     }
 
-    void HandleServerMessage(string msg)
+    void OnApplicationQuit()
     {
-        if (msg.StartsWith("POS:BALL:"))
-        {
-            string[] parts = msg.Split(':');
-            float x = float.Parse(parts[2]);
-            float y = float.Parse(parts[3]);
-
-            mainThreadActions.Enqueue(() => ball.MovePosition(new Vector2(x, y)));
-        }
-        else if (msg.StartsWith("POS:"))
-        {
-            string[] parts = msg.Split(':');
-            int otherId = int.Parse(parts[1]);
-            float x = float.Parse(parts[2]);
-            float y = float.Parse(parts[3]);
-
-            if (otherId != id)
-                mainThreadActions.Enqueue(() => remoteCube.MovePosition(new Vector2(x, y)));
-        }
-        else if (msg.StartsWith("SCORE:"))
-        {
-            Debug.Log(msg);
-        }
-    }
-
-    void SendMessageToServer(string message)
-    {
-        byte[] data = Encoding.UTF8.GetBytes(message);
-        udpClient.Send(data, data.Length, remoteEndPoint);
-    }
-
-    private void OnApplicationQuit()
-    {
-        udpClient?.Close();
         receiveThread?.Abort();
+        client?.Close();
     }
 }
