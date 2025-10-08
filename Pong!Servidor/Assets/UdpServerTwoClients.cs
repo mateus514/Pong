@@ -1,138 +1,156 @@
-using UnityEngine;
+using System;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Collections.Generic;
-using System.Globalization;
+using UnityEngine;
 
-public class UdpServerTwoClients : MonoBehaviour
+public class ServidorUDP : MonoBehaviour
 {
     UdpClient server;
-    IPEndPoint anyEP;
     Thread receiveThread;
-    Dictionary<string, int> clientIds = new Dictionary<string, int>();
-    int nextId = 1;
 
-    // --- Bola ---
+    IPEndPoint client1EP;
+    IPEndPoint client2EP;
+
+    Vector2 paddle1 = new Vector2(-8f, 0f);
+    Vector2 paddle2 = new Vector2(8f, 0f);
+
     Vector2 ballPos = Vector2.zero;
-    Vector2 ballDir;
-    float ballSpeed = 5f;
-    GameObject ballObject;
+    Vector2 ballVel = new Vector2(6f, 3f);
+
+    float fieldWidth = 9f;
+    float fieldHeight = 5f;
+
+    int score1 = 0;
+    int score2 = 0;
+
+    float tickRate = 1f / 60f;
+    float accumulator = 0f;
 
     void Start()
     {
         server = new UdpClient(5001);
-        anyEP = new IPEndPoint(IPAddress.Any, 0);
-
         receiveThread = new Thread(ReceiveData);
         receiveThread.IsBackground = true;
         receiveThread.Start();
 
-        Debug.Log("Servidor iniciado na porta 5001");
-
-        // Direção aleatória da bola
-        bool isRight = Random.value >= 0.5f;
-        float xVelocity = isRight ? 1f : -1f;
-        float yVelocity = Random.Range(-1f, 1f);
-        ballDir = new Vector2(xVelocity, yVelocity).normalized;
-
-        // Cria a bola visualmente (opcional)
-        CreateBallObject();
+        Debug.Log("[Servidor] Iniciado na porta 5001");
     }
 
     void Update()
     {
-        // Movimento da bola
-        ballPos += ballDir * ballSpeed * Time.deltaTime;
-
-        // Rebater nas bordas (campo de jogo entre x = ±8 e y = ±4)
-        if (ballPos.y > 4f || ballPos.y < -4f)
+        accumulator += Time.deltaTime;
+        while (accumulator >= tickRate)
         {
-            ballDir.y *= -1;
+            UpdateGame(tickRate);
+            accumulator -= tickRate;
+        }
+    }
+
+    void UpdateGame(float dt)
+    {
+        ballPos += ballVel * dt;
+
+        // Colisão com bordas
+        if (ballPos.y > fieldHeight)
+        {
+            ballPos.y = fieldHeight;
+            ballVel.y *= -1;
+        }
+        else if (ballPos.y < -fieldHeight)
+        {
+            ballPos.y = -fieldHeight;
+            ballVel.y *= -1;
         }
 
-        if (ballPos.x > 8f || ballPos.x < -8f)
+        // Colisão com paddles
+        if (Mathf.Abs(ballPos.x - paddle1.x) < 0.6f && Mathf.Abs(ballPos.y - paddle1.y) < 1.2f && ballVel.x < 0)
+            ballVel.x *= -1;
+        if (Mathf.Abs(ballPos.x - paddle2.x) < 0.6f && Mathf.Abs(ballPos.y - paddle2.y) < 1.2f && ballVel.x > 0)
+            ballVel.x *= -1;
+
+        // Pontuação
+        if (ballPos.x > fieldWidth)
         {
-            ballDir.x *= -1;
+            score1++;
+            ResetBall(-1);
+        }
+        else if (ballPos.x < -fieldWidth)
+        {
+            score2++;
+            ResetBall(1);
         }
 
-        // Atualiza posição da bola visualmente (no editor do Unity)
-        if (ballObject != null)
-        {
-            ballObject.transform.position = new Vector3(ballPos.x, ballPos.y, 0f);
-        }
+        // Envia atualizações
+        Broadcast($"POS:1;{paddle1.x:F2};{paddle1.y:F2}");
+        Broadcast($"POS:2;{paddle2.x:F2};{paddle2.y:F2}");
+        Broadcast($"BALL:{ballPos.x:F2};{ballPos.y:F2}");
+        Broadcast($"SCORE:{score1};{score2}");
+    }
 
-        // Envia posição da bola para todos os clientes
-        BroadcastBallPosition();
+    void ResetBall(int direction)
+    {
+        ballPos = Vector2.zero;
+        ballVel = new Vector2(direction * 6f, UnityEngine.Random.Range(-3f, 3f));
     }
 
     void ReceiveData()
     {
+        IPEndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+
         while (true)
         {
             try
             {
-                byte[] data = server.Receive(ref anyEP);
+                byte[] data = server.Receive(ref remoteEP);
                 string msg = Encoding.UTF8.GetString(data);
-                string key = anyEP.Address + ":" + anyEP.Port;
 
-                if (!clientIds.ContainsKey(key))
+                if (msg == "HELLO")
                 {
-                    clientIds[key] = nextId++;
-                    string assignMsg = "ASSIGN:" + clientIds[key];
-                    server.Send(Encoding.UTF8.GetBytes(assignMsg), assignMsg.Length, anyEP);
-                    Debug.Log($"Cliente novo conectado: {key} => ID {clientIds[key]}");
-                }
-
-                int id = clientIds[key];
-
-                if (msg.StartsWith("POS:"))
-                {
-                    string coords = msg.Substring(4);
-                    string broadcast = $"POS:{id};{coords}";
-                    byte[] bdata = Encoding.UTF8.GetBytes(broadcast);
-
-                    foreach (var kvp in clientIds)
+                    if (client1EP == null)
                     {
-                        var parts = kvp.Key.Split(':');
-                        IPEndPoint ep = new IPEndPoint(IPAddress.Parse(parts[0]), int.Parse(parts[1]));
-                        server.Send(bdata, bdata.Length, ep);
+                        client1EP = remoteEP;
+                        Send(client1EP, "ASSIGN:1");
+                        Debug.Log("[Servidor] Cliente 1 conectado");
+                    }
+                    else if (client2EP == null)
+                    {
+                        client2EP = remoteEP;
+                        Send(client2EP, "ASSIGN:2");
+                        Debug.Log("[Servidor] Cliente 2 conectado");
                     }
                 }
+                else if (msg.StartsWith("POS:"))
+                {
+                    string[] parts = msg.Substring(4).Split(';');
+                    float x = float.Parse(parts[0], System.Globalization.CultureInfo.InvariantCulture);
+                    float y = float.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture);
+
+                    if (remoteEP.Equals(client1EP))
+                        paddle1.y = y;
+                    else if (remoteEP.Equals(client2EP))
+                        paddle2.y = y;
+                }
             }
-            catch (SocketException ex)
+            catch (Exception e)
             {
-                Debug.LogError("Erro ao receber dados: " + ex.Message);
+                Debug.LogError("[Servidor] Erro: " + e.Message);
             }
         }
     }
 
-    void BroadcastBallPosition()
+    void Broadcast(string msg)
     {
-        string msg = $"BALL:{ballPos.x.ToString("F2", CultureInfo.InvariantCulture)};" +
-                     $"{ballPos.y.ToString("F2", CultureInfo.InvariantCulture)}";
         byte[] data = Encoding.UTF8.GetBytes(msg);
-
-        foreach (var kvp in clientIds)
-        {
-            var parts = kvp.Key.Split(':');
-            IPEndPoint ep = new IPEndPoint(IPAddress.Parse(parts[0]), int.Parse(parts[1]));
-            server.Send(data, data.Length, ep);
-        }
+        if (client1EP != null) server.Send(data, data.Length, client1EP);
+        if (client2EP != null) server.Send(data, data.Length, client2EP);
     }
 
-    void CreateBallObject()
+    void Send(IPEndPoint ep, string msg)
     {
-        ballObject = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        ballObject.transform.localScale = new Vector3(0.5f, 0.5f, 0.5f);
-        ballObject.transform.position = new Vector3(ballPos.x, ballPos.y, 0f);
-        ballObject.name = "Bola";
-        Renderer renderer = ballObject.GetComponent<Renderer>();
-        if (renderer != null)
-        {
-            renderer.material.color = Color.yellow;
-        }
+        byte[] data = Encoding.UTF8.GetBytes(msg);
+        server.Send(data, data.Length, ep);
     }
 
     void OnApplicationQuit()
